@@ -20,7 +20,7 @@ from timm.models.vision_transformer import Block
 from .util.pos_embed import get_2d_sincos_pos_embed, get_2d_sincos_pos_embed_flexible, get_1d_sincos_pos_embed_from_grid
 from .util.misc import concat_all_gather
 from .util.patch_embed import PatchEmbed_new, PatchEmbed_org
-from timm.models.swin_transformer import SwinTransformerBlock
+from .timm_patch.swin_transformer import SwinTransformerBlock
 
 class MaskedAutoencoderViT(nn.Module):
     """ Masked Autoencoder with VisionTransformer backbone
@@ -57,7 +57,7 @@ class MaskedAutoencoderViT(nn.Module):
         self.encoder_depth = depth
         self.contextual_depth = contextual_depth
         self.blocks = nn.ModuleList([
-            Block(embed_dim, num_heads, mlp_ratio, qkv_bias=True, qk_scale=None, norm_layer=norm_layer)
+            Block(embed_dim, num_heads, mlp_ratio, qkv_bias=True, qk_norm=None, norm_layer=norm_layer)
             for i in range(depth)])
         self.norm = norm_layer(embed_dim)
 
@@ -110,7 +110,7 @@ class MaskedAutoencoderViT(nn.Module):
         else:
             # Transfomer
             self.decoder_blocks = nn.ModuleList([
-                Block(decoder_embed_dim, decoder_num_heads, mlp_ratio, qkv_bias=True, qk_scale=None, norm_layer=norm_layer)
+                Block(decoder_embed_dim, decoder_num_heads, mlp_ratio, qkv_bias=True, qk_norm=None, norm_layer=norm_layer)
                 for i in range(decoder_depth)])
 
         self.decoder_norm = norm_layer(decoder_embed_dim)
@@ -398,6 +398,49 @@ class MaskedAutoencoderViT(nn.Module):
             pred = pred[:, 1:, :]
         return pred, None, None #emb, emb_pixel
 
+    def forward_decoder_no_mask(self, x):
+        # embed tokens
+        x = self.decoder_embed(x)
+
+        # # append mask tokens to sequence
+        # mask_tokens = self.mask_token.repeat(x.shape[0], ids_restore.shape[1] + 1 - x.shape[1], 1)
+        # x_ = torch.cat([x[:, 1:, :], mask_tokens], dim=1)  # no cls token
+        # x_ = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]))  # unshuffle
+        # x = torch.cat([x[:, :1, :], x_], dim=1)  # append cls token
+
+        # add pos embed
+        x = x + self.decoder_pos_embed
+        
+        if self.decoder_mode != 0:
+            B,L,D=x.shape
+            x = x[:,1:,:]
+            if self.use_custom_patch:
+                x = x.reshape(B,101,12,D)
+                x = torch.cat([x,x[:,-1,:].unsqueeze(1)],dim=1) # hack
+                x = x.reshape(B,1224,D)
+        if self.decoder_mode > 3: # mvit
+            x = self.decoder_blocks(x)
+        else:
+            # apply Transformer blocks
+            for blk in self.decoder_blocks:
+                x = blk(x)
+        x = self.decoder_norm(x)
+
+        # predictor projection
+        pred = self.decoder_pred(x)
+
+        # remove cls token
+        if self.decoder_mode != 0:
+            if self.use_custom_patch:
+                pred = pred.reshape(B,102,12,256)
+                pred = pred[:,:101,:,:]
+                pred = pred.reshape(B,1212,256)
+            else:
+                pred = pred
+        else:
+            pred = pred[:, 1:, :]
+        return self.unpatchify(pred)
+
     def forward_loss(self, imgs, pred, mask, norm_pix_loss=False):
         """
         imgs: [N, 3, H, W]
@@ -420,7 +463,7 @@ class MaskedAutoencoderViT(nn.Module):
         emb_enc, mask, ids_restore, _ = self.forward_encoder(imgs, mask_ratio, mask_2d=self.mask_2d)
         pred, _, _ = self.forward_decoder(emb_enc, ids_restore)  # [N, L, p*p*3]
         loss_recon = self.forward_loss(imgs, pred, mask, norm_pix_loss=self.norm_pix_loss)
-        loss_contrastive = torch.FloatTensor([0.0]).cuda()
+        loss_contrastive = torch.FloatTensor([0.0]).to(imgs.device)
         return loss_recon, pred, mask, loss_contrastive
 
 
